@@ -96,15 +96,45 @@ go run ./cmd/gitcorsproxy -origins https://go-tex.github.io -hosts github.com
 
 Each flag falls back to an environment variable:
 
-| Flag        | Env                     | Default   | Meaning                              |
-|-------------|-------------------------|-----------|--------------------------------------|
-| `-listen`   | `GITCORSPROXY_LISTEN`   | `:8181`   | listen address                       |
-| `-origins`  | `GITCORSPROXY_ORIGINS`  | —         | comma-separated allowed origins      |
-| `-hosts`    | `GITCORSPROXY_HOSTS`    | —         | comma-separated upstream host allow-list |
-| `-tls-cert` | `GITCORSPROXY_TLS_CERT` | —         | optional TLS certificate file        |
-| `-tls-key`  | `GITCORSPROXY_TLS_KEY`  | —         | optional TLS key file                |
+| Flag                  | Env                               | Default      | Meaning                                              |
+|-----------------------|-----------------------------------|--------------|------------------------------------------------------|
+| `-listen`             | `GITCORSPROXY_LISTEN`             | `:8181`      | listen address                                       |
+| `-origins`            | `GITCORSPROXY_ORIGINS`            | —            | comma-separated allowed origins                      |
+| `-hosts`              | `GITCORSPROXY_HOSTS`              | —            | comma-separated upstream host allow-list             |
+| `-tls-cert`           | `GITCORSPROXY_TLS_CERT`           | —            | optional TLS certificate file                        |
+| `-tls-key`            | `GITCORSPROXY_TLS_KEY`            | —            | optional TLS key file                                |
+| `-rate`               | `GITCORSPROXY_RATE`               | `120`        | requests per minute per client IP (`0` disables)     |
+| `-burst`              | `GITCORSPROXY_BURST`              | `30`         | back-to-back request burst per client IP             |
+| `-trusted-hops`       | `GITCORSPROXY_TRUSTED_HOPS`       | `1`          | trusted reverse-proxy hops for `X-Forwarded-For`     |
+| `-max-response-bytes` | `GITCORSPROXY_MAX_RESPONSE_BYTES` | `1073741824` | cap on one relayed response in bytes (`0` unlimited) |
+| `-timeout`            | `GITCORSPROXY_TIMEOUT`            | `5m0s`       | per-request timeout (`0` = none)                     |
 
 `-origins` and `-hosts` are required.
+
+## Abuse / DoS hardening
+
+A browser CORS proxy is **publicly reachable and cannot source-restrict** — the
+playground runs in end-users' browsers, so the proxy cannot allow-list callers.
+It therefore defends itself:
+
+- **Per-client-IP rate limiting.** A concurrency-safe token bucket (a tiny
+  internal implementation — the package keeps its **zero-dependency** posture)
+  keyed on the real client IP. Over budget → `429` with a `Retry-After` header.
+  Idle buckets are swept and the live set is capped, so a spray of forged IPs
+  cannot grow memory without bound.
+- **Trustworthy client IP.** Behind Caddy the real client is the **rightmost**
+  `X-Forwarded-For` entry Caddy appended — a client-forged **leftmost** entry is
+  ignored. `-trusted-hops` N reads the `(1+N)`-th entry from the right of the
+  `[X-Forwarded-For…, RemoteAddr]` chain (default `1` = one Caddy hop), falling
+  back to the connection `RemoteAddr` when the header is absent or too short.
+- **Response-size cap.** `-max-response-bytes` bounds a single relayed response
+  so the proxy cannot be used to shift unbounded bandwidth. A declared
+  `Content-Length` over the cap is refused `502` before any body streams; an
+  undeclared (chunked) body is truncated at the cap.
+- **Per-request timeout.** `-timeout` bounds the whole proxied request via a
+  context deadline, so a slow-loris or hung upstream cannot pin resources.
+
+None of these paths log the `Authorization` header or the token.
 
 ## Deployment (behind the sovereign EU Caddy)
 

@@ -43,6 +43,14 @@
 //   - The Authorization header is forwarded upstream but NEVER logged. Nothing
 //     in this package writes a token, a header dump, or a request body to the
 //     logger.
+//   - Because a browser CORS proxy is publicly reachable and cannot
+//     source-restrict, it defends itself against abuse/DoS: a per-client-IP
+//     token-bucket rate limit (429 + Retry-After), a cap on the size of a single
+//     relayed response, and a per-request timeout. The client IP is read from
+//     X-Forwarded-For counting from the right by a trusted-hops count, so a
+//     client-forged leftmost entry cannot spoof the limiter key. These paths
+//     never log the token either. See Config for the knobs; all default to off
+//     in the library (the command sets production defaults).
 //
 // The proxy stores nothing: it is a pure auth-passthrough. The browser holds
 // the user's PAT and sends it on each request; the proxy relays it and forgets
@@ -50,6 +58,7 @@
 package gitcorsproxy
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -57,7 +66,9 @@ import (
 	"net"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
+	"time"
 )
 
 // Config configures a Proxy. AllowedOrigins and UpstreamHosts are required;
@@ -93,6 +104,54 @@ type Config struct {
 	// LookupIP resolves a host to its IPs for the SSRF pre-flight. Defaults to
 	// net.LookupIP. Injectable for tests.
 	LookupIP func(host string) ([]net.IP, error)
+
+	// --- abuse / DoS hardening (a browser CORS proxy is publicly reachable
+	// and cannot source-restrict, so these bound what one client can extract)
+	// ---
+
+	// RatePerMinute is the sustained request budget per client IP. When it is
+	// <= 0 rate limiting is disabled (the library default); the command sets a
+	// production default. On exceed the proxy answers 429 with Retry-After.
+	RatePerMinute int
+
+	// Burst is the token-bucket ceiling: the number of requests a single client
+	// IP may make back-to-back before the per-minute rate throttles it. When
+	// <= 0 it falls back to RatePerMinute (a one-minute burst). Ignored when
+	// rate limiting is disabled.
+	Burst int
+
+	// TrustedProxyHops is the number of trusted reverse proxies (Caddy, plus any
+	// trusted CDN in front of it) between the client and this process. The real
+	// client IP is read as the (1+hops)-th entry from the right of the
+	// [X-Forwarded-For…, RemoteAddr] chain, so a client-forged LEFTMOST
+	// X-Forwarded-For entry cannot spoof the limiter key. Default 0 means "trust
+	// nothing, key on RemoteAddr"; the command defaults it to 1 for the
+	// behind-Caddy deployment.
+	TrustedProxyHops int
+
+	// MaxResponseBytes caps the size of a single relayed upstream response so
+	// the proxy cannot be used to shift unbounded bandwidth. 0 means unlimited
+	// (the library default); the command sets a production default. A response
+	// whose declared Content-Length exceeds the cap is refused 502 before any
+	// body is streamed; an undeclared (chunked) body is truncated at the cap.
+	MaxResponseBytes int64
+
+	// Timeout bounds the whole proxied request (upstream round-trip plus body
+	// relay) via a context deadline, so a slow-loris or hung upstream cannot pin
+	// resources. 0 means no deadline (the library default); the command sets a
+	// production default.
+	Timeout time.Duration
+
+	// Now is the limiter's clock. Defaults to time.Now; injectable for tests.
+	Now func() time.Time
+
+	// MaxTrackedIPs bounds the number of live per-IP buckets. Defaults to 65536.
+	// Injectable for tests.
+	MaxTrackedIPs int
+
+	// IdleEvictAfter is how long a per-IP bucket may go unseen before it is
+	// swept. Defaults to 10 minutes. Injectable for tests.
+	IdleEvictAfter time.Duration
 }
 
 // Proxy is an http.Handler implementing the CORS git smart-HTTP proxy. It is
@@ -104,7 +163,15 @@ type Proxy struct {
 	log       *slog.Logger
 	transport http.RoundTripper
 	lookupIP  func(host string) ([]net.IP, error)
+
+	limiter  *rateLimiter // nil when rate limiting is disabled
+	hops     int
+	maxBytes int64
+	timeout  time.Duration
 }
+
+// errResponseTooLarge marks a relayed body that ran past MaxResponseBytes.
+var errResponseTooLarge = errors.New("gitcorsproxy: upstream response exceeds size cap")
 
 // New validates cfg and returns a ready Proxy. It errors when the required
 // allowlists are empty or when AllowedOrigins contains a wildcard.
@@ -141,6 +208,10 @@ func New(cfg Config) (*Proxy, error) {
 		return nil, errors.New("gitcorsproxy: at least one upstream host is required")
 	}
 
+	hops := cfg.TrustedProxyHops
+	if hops < 0 {
+		hops = 0
+	}
 	p := &Proxy{
 		origins:   origins,
 		hosts:     hosts,
@@ -148,6 +219,9 @@ func New(cfg Config) (*Proxy, error) {
 		log:       cfg.Logger,
 		transport: cfg.Transport,
 		lookupIP:  cfg.LookupIP,
+		hops:      hops,
+		maxBytes:  cfg.MaxResponseBytes,
+		timeout:   cfg.Timeout,
 	}
 	if p.scheme == "" {
 		p.scheme = "https"
@@ -164,6 +238,25 @@ func New(cfg Config) (*Proxy, error) {
 	}
 	if p.lookupIP == nil {
 		p.lookupIP = net.LookupIP
+	}
+	if cfg.RatePerMinute > 0 {
+		burst := cfg.Burst
+		if burst <= 0 {
+			burst = cfg.RatePerMinute
+		}
+		now := cfg.Now
+		if now == nil {
+			now = time.Now
+		}
+		maxKeys := cfg.MaxTrackedIPs
+		if maxKeys <= 0 {
+			maxKeys = 1 << 16
+		}
+		idle := cfg.IdleEvictAfter
+		if idle <= 0 {
+			idle = 10 * time.Minute
+		}
+		p.limiter = newRateLimiter(cfg.RatePerMinute, burst, maxKeys, idle, now)
 	}
 	return p, nil
 }
@@ -205,9 +298,29 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p.setCORS(w, r)
 
 	if r.Method == http.MethodOptions {
+		// A CORS preflight is cheap and must always be answerable, so it is not
+		// rate limited.
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
+
+	// Per-client-IP rate limit. Keyed on the trustworthy client IP (see
+	// clientIP) so one browser cannot exhaust the shared upstream, and a
+	// forged X-Forwarded-For cannot spoof another client's budget.
+	if p.limiter != nil {
+		key := p.clientIP(r)
+		if ok, retry := p.limiter.allow(key); !ok {
+			secs := int(retry.Seconds())
+			if secs < 1 {
+				secs = 1
+			}
+			w.Header().Set("Retry-After", strconv.Itoa(secs))
+			p.log.Warn("gitcorsproxy: rate limited", "client", key)
+			http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
+			return
+		}
+	}
+
 	if r.Method != http.MethodGet && r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -263,7 +376,17 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Authorization header, token or body.
 	p.log.Info("gitcorsproxy: proxying", "method", r.Method, "host", host, "path", upstreamPath, "service", queryService(r, service))
 
-	req, err := http.NewRequestWithContext(r.Context(), r.Method, upstream, r.Body)
+	// Bound the whole proxied request so a slow/hung upstream cannot pin
+	// resources. The deadline covers the round-trip AND the streamed body,
+	// because the request context propagates to resp.Body reads.
+	ctx := r.Context()
+	if p.timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, p.timeout)
+		defer cancel()
+	}
+
+	req, err := http.NewRequestWithContext(ctx, r.Method, upstream, r.Body)
 	if err != nil {
 		http.Error(w, "bad upstream request", http.StatusInternalServerError)
 		return
@@ -279,6 +402,15 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
+	// Size cap: a response that DECLARES a length past the cap is refused before
+	// any body is written, so the client sees a clean error rather than a
+	// truncated stream. An undeclared (chunked) body is capped mid-stream below.
+	if p.maxBytes > 0 && resp.ContentLength > p.maxBytes {
+		p.log.Warn("gitcorsproxy: upstream response too large", "host", host, "declared", resp.ContentLength, "cap", p.maxBytes)
+		http.Error(w, "upstream response too large", http.StatusBadGateway)
+		return
+	}
+
 	copyHeaders(w.Header(), resp.Header, forwardResponseHeaders)
 	if cl := resp.Header.Get("Content-Length"); cl != "" {
 		w.Header().Set("Content-Length", cl)
@@ -287,11 +419,29 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if f, ok := w.(http.Flusher); ok {
 		f.Flush()
 	}
-	if _, err := io.Copy(w, resp.Body); err != nil {
+	if _, err := p.copyBody(w, resp.Body); err != nil {
 		// Headers and status are already on the wire, so we cannot signal the
 		// failure to the client — record it (never the token) and stop.
 		p.log.Warn("gitcorsproxy: response copy interrupted", "host", host, "error", err.Error())
 	}
+}
+
+// copyBody relays the upstream body to w, enforcing MaxResponseBytes. With no
+// cap it is a plain io.Copy. With a cap it copies at most maxBytes and then
+// checks for a single trailing byte; if the upstream had more, the relay stops
+// with errResponseTooLarge (the client keeps the truncated bytes already sent).
+func (p *Proxy) copyBody(w io.Writer, body io.Reader) (int64, error) {
+	if p.maxBytes <= 0 {
+		return io.Copy(w, body)
+	}
+	n, err := io.Copy(w, io.LimitReader(body, p.maxBytes))
+	if err != nil {
+		return n, err
+	}
+	if extra, _ := io.CopyN(io.Discard, body, 1); extra > 0 {
+		return n, errResponseTooLarge
+	}
+	return n, nil
 }
 
 // setCORS writes the CORS headers. Access-Control-Allow-Origin echoes the
@@ -393,4 +543,42 @@ func queryService(r *http.Request, service string) string {
 		return r.URL.Query().Get("service")
 	}
 	return service
+}
+
+// clientIP returns the trustworthy client IP for rate limiting.
+//
+// The proxy runs behind p.hops trusted reverse proxies (Caddy, plus any trusted
+// CDN in front of it). Treat [X-Forwarded-For entries…, RemoteAddr] as the
+// address chain, rightmost = nearest to us. RemoteAddr is the immediate trusted
+// peer, and each trusted proxy appended the address IT saw. The real client is
+// therefore the (1+hops)-th entry from the right of that chain: skip RemoteAddr
+// and the hops-1 trusted XFF entries our proxies added, and take the next one.
+//
+// Crucially this counts from the RIGHT, so a client that forges a LEFTMOST
+// X-Forwarded-For value cannot move the key — the forged entry sits to the left
+// of the address Caddy appended and is never selected. With hops <= 0 (trust
+// nothing) or when X-Forwarded-For is absent or too short, it falls back to
+// RemoteAddr.
+func (p *Proxy) clientIP(r *http.Request) string {
+	remote := r.RemoteAddr
+	if h, _, err := net.SplitHostPort(remote); err == nil {
+		remote = h
+	}
+	if p.hops <= 0 {
+		return remote
+	}
+	xff := r.Header.Get("X-Forwarded-For")
+	if xff == "" {
+		return remote
+	}
+	parts := strings.Split(xff, ",")
+	// parts[idx] is the (1+hops)-th-from-right element of [parts…, RemoteAddr].
+	idx := len(parts) - p.hops
+	if idx < 0 {
+		return remote
+	}
+	if ip := strings.TrimSpace(parts[idx]); ip != "" {
+		return ip
+	}
+	return remote
 }
