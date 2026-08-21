@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"testing"
+	"time"
 )
 
 // swapServe replaces both serve seams and returns a restore func.
@@ -107,6 +108,61 @@ func TestRunEnvFallback(t *testing.T) {
 	defer restore()
 	if code := run(nil, &bytes.Buffer{}); code != 0 {
 		t.Fatalf("code = %d, want 0", code)
+	}
+}
+
+func TestRunHardeningFlags(t *testing.T) {
+	restore := swapServe(func(*http.Server, string, string) error { return nil }, nil)
+	defer restore()
+	code := run([]string{
+		"-origins", "https://x", "-hosts", "github.com",
+		"-rate", "5", "-burst", "2", "-trusted-hops", "2",
+		"-max-response-bytes", "1024", "-timeout", "1s",
+	}, &bytes.Buffer{})
+	if code != 0 {
+		t.Fatalf("code = %d, want 0", code)
+	}
+}
+
+func TestEnvInt(t *testing.T) {
+	if got := envInt("GITCORSPROXY_TEST_INT", 7); got != 7 {
+		t.Fatalf("unset → %d, want default 7", got)
+	}
+	t.Setenv("GITCORSPROXY_TEST_INT", "42")
+	if got := envInt("GITCORSPROXY_TEST_INT", 7); got != 42 {
+		t.Fatalf("set valid → %d, want 42", got)
+	}
+	t.Setenv("GITCORSPROXY_TEST_INT", "notanint")
+	if got := envInt("GITCORSPROXY_TEST_INT", 7); got != 7 {
+		t.Fatalf("set invalid → %d, want default 7", got)
+	}
+}
+
+func TestEnvInt64(t *testing.T) {
+	if got := envInt64("GITCORSPROXY_TEST_I64", 9); got != 9 {
+		t.Fatalf("unset → %d, want default 9", got)
+	}
+	t.Setenv("GITCORSPROXY_TEST_I64", "1073741824")
+	if got := envInt64("GITCORSPROXY_TEST_I64", 9); got != 1<<30 {
+		t.Fatalf("set valid → %d, want 1<<30", got)
+	}
+	t.Setenv("GITCORSPROXY_TEST_I64", "nope")
+	if got := envInt64("GITCORSPROXY_TEST_I64", 9); got != 9 {
+		t.Fatalf("set invalid → %d, want default 9", got)
+	}
+}
+
+func TestEnvDuration(t *testing.T) {
+	if got := envDuration("GITCORSPROXY_TEST_DUR", time.Second); got != time.Second {
+		t.Fatalf("unset → %v, want default 1s", got)
+	}
+	t.Setenv("GITCORSPROXY_TEST_DUR", "2m30s")
+	if got := envDuration("GITCORSPROXY_TEST_DUR", time.Second); got != 150*time.Second {
+		t.Fatalf("set valid → %v, want 2m30s", got)
+	}
+	t.Setenv("GITCORSPROXY_TEST_DUR", "banana")
+	if got := envDuration("GITCORSPROXY_TEST_DUR", time.Second); got != time.Second {
+		t.Fatalf("set invalid → %v, want default 1s", got)
 	}
 }
 
