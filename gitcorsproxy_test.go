@@ -265,6 +265,59 @@ func TestServeSSRFRejections(t *testing.T) {
 	}
 }
 
+// TestServe403LogsClientIP pins the abuse-signal contract: every 403 rejection
+// path — the allowlist reject and the SSRF-guard reject — logs the trustworthy
+// client IP (so a fail2ban-style banner can extract and ban the offender), and
+// none of them ever writes the forwarded token or the Authorization header.
+func TestServe403LogsClientIP(t *testing.T) {
+	const clientIP = "203.0.113.42"
+
+	// do drives one 403 rejection with a logger attached and the client's
+	// RemoteAddr + Authorization set, returning the captured log output.
+	do := func(t *testing.T, cfg Config, target string) string {
+		t.Helper()
+		logBuf := &bytes.Buffer{}
+		cfg.Logger = slog.New(slog.NewTextHandler(logBuf, nil))
+		p := mustProxy(t, cfg)
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, target, nil)
+		req.RemoteAddr = clientIP + ":51000"
+		req.Header.Set("Authorization", "token "+testToken)
+		p.ServeHTTP(rec, req)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("code = %d, want 403", rec.Code)
+		}
+		return logBuf.String()
+	}
+
+	// assert checks the rejection line names host and carries client=<ip>, and
+	// that neither the token nor the Authorization header leaked.
+	assert := func(t *testing.T, out, wantSubstr string) {
+		t.Helper()
+		if !strings.Contains(out, wantSubstr) {
+			t.Fatalf("log missing rejection %q:\n%s", wantSubstr, out)
+		}
+		if !strings.Contains(out, "client="+clientIP) {
+			t.Fatalf("403 log missing client=%s:\n%s", clientIP, out)
+		}
+		if strings.Contains(out, testToken) || strings.Contains(out, "Authorization") {
+			t.Fatalf("token/Authorization leaked into 403 log:\n%s", out)
+		}
+	}
+
+	t.Run("host not allowed", func(t *testing.T) {
+		out := do(t, Config{}, "http://p/evil.com/o/r.git/git-upload-pack")
+		assert(t, out, "host not allowed")
+	})
+
+	t.Run("SSRF guard", func(t *testing.T) {
+		out := do(t, Config{LookupIP: func(string) ([]net.IP, error) {
+			return []net.IP{net.ParseIP("10.1.2.3")}, nil
+		}}, "http://p/github.com/o/r.git/git-upload-pack")
+		assert(t, out, "SSRF guard")
+	})
+}
+
 func TestServeHostWithPort(t *testing.T) {
 	// A host carrying an explicit :port exercises checkHost's SplitHostPort
 	// branch; an injected transport avoids a real dial.

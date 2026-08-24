@@ -353,7 +353,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Allowlist: the primary SSRF control.
 	if _, ok := p.hosts[strings.ToLower(host)]; !ok {
-		p.log.Warn("gitcorsproxy: host not allowed", "host", host)
+		p.log.Warn("gitcorsproxy: host not allowed", "host", host, "client", p.clientIP(r))
 		http.Error(w, "upstream host not allowed", http.StatusForbidden)
 		return
 	}
@@ -361,7 +361,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Defence in depth: refuse an allowlisted host that resolves into a
 	// private/loopback/link-local/metadata range.
 	if err := p.checkHost(host); err != nil {
-		p.log.Warn("gitcorsproxy: host rejected by SSRF guard", "host", host, "reason", err.Error())
+		p.log.Warn("gitcorsproxy: host rejected by SSRF guard", "host", host, "reason", err.Error(), "client", p.clientIP(r))
 		http.Error(w, "upstream host rejected", http.StatusForbidden)
 		return
 	}
