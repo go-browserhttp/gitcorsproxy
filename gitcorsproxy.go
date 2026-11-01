@@ -41,8 +41,18 @@
 //     from the loom server's checkRemoteIP), so an allowlisted host that
 //     resolves into an internal range is still refused.
 //   - The Authorization header is forwarded upstream but NEVER logged. Nothing
-//     in this package writes a token, a header dump, or a request body to the
-//     logger.
+//     in this package writes a token, a header dump, a query string or a
+//     request body to the logger (an upstream error is logged without its URL,
+//     whose query a client controls).
+//   - It goes only to the allowlisted upstream of that request: the proxy uses
+//     RoundTrip, which never follows a redirect, and relays no Location header.
+//   - A response to a request that carried Authorization is marked
+//     "Cache-Control: private, no-store" with "Vary: Authorization", so no
+//     shared cache in front of the proxy can serve one person's private
+//     repository to another.
+//   - The operator of a proxy can read every token that passes through it.
+//     A public proxy is a trust decision: prefer a forge's REST API, which needs
+//     no proxy, or run your own.
 //   - Because a browser CORS proxy is publicly reachable and cannot
 //     source-restrict, it defends itself against abuse/DoS: a per-client-IP
 //     token-bucket rate limit (429 + Retry-After), a cap on the size of a single
@@ -65,6 +75,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -396,7 +407,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := p.transport.RoundTrip(req)
 	if err != nil {
-		p.log.Warn("gitcorsproxy: upstream error", "host", host, "error", err.Error())
+		p.log.Warn("gitcorsproxy: upstream error", "host", host, "error", upstreamErr(err))
 		http.Error(w, "upstream unreachable", http.StatusBadGateway)
 		return
 	}
@@ -415,6 +426,14 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if cl := resp.Header.Get("Content-Length"); cl != "" {
 		w.Header().Set("Content-Length", cl)
 	}
+	if r.Header.Get("Authorization") != "" {
+		// An authenticated answer belongs to one person. Override whatever the
+		// upstream said, so no shared cache between the browser and us keeps it.
+		w.Header().Set("Cache-Control", "private, no-store")
+		w.Header().Del("Expires")
+		w.Header().Del("Pragma")
+		w.Header().Add("Vary", "Authorization")
+	}
 	w.WriteHeader(resp.StatusCode)
 	if f, ok := w.(http.Flusher); ok {
 		f.Flush()
@@ -424,6 +443,17 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// failure to the client — record it (never the token) and stop.
 		p.log.Warn("gitcorsproxy: response copy interrupted", "host", host, "error", err.Error())
 	}
+}
+
+// upstreamErr is the loggable text of a round-trip error: a *url.Error carries
+// the full upstream URL, whose query string the client chose (and could have
+// put a credential in), so only the operation and the underlying cause are kept.
+func upstreamErr(err error) string {
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		return ue.Op + ": " + upstreamErr(ue.Err)
+	}
+	return err.Error()
 }
 
 // copyBody relays the upstream body to w, enforcing MaxResponseBytes. With no
