@@ -476,8 +476,9 @@ func TestE2EInfoRefs(t *testing.T) {
 	if ct := rec.Header().Get("Content-Type"); ct != "application/x-git-upload-pack-advertisement" {
 		t.Errorf("Content-Type = %q, not preserved", ct)
 	}
-	if rec.Header().Get("Cache-Control") != "no-cache" {
-		t.Errorf("Cache-Control not forwarded")
+	// An authenticated response is never left to the upstream's cache policy.
+	if rec.Header().Get("Cache-Control") != "private, no-store" {
+		t.Errorf("Cache-Control = %q, want private, no-store", rec.Header().Get("Cache-Control"))
 	}
 	if rec.Header().Get("Access-Control-Allow-Origin") != testOrigin {
 		t.Errorf("ACAO not added on proxied response")

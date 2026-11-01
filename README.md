@@ -71,7 +71,23 @@ are preserved on the way back.
   IPv6-ULA deny-list (ported from the loom server's `checkRemoteIP`), so an
   allow-listed host that resolves into an internal range is still refused.
 - The **`Authorization` header is never logged.** Nothing in this package
-  writes a token, a header dump, or a request body to the logger.
+  writes a token, a header dump, a query string or a request body to the
+  logger. An upstream error is logged without its URL, because a client
+  controls the query string and could have put a credential in it.
+- **It reaches only that request's upstream.** The proxy uses `RoundTrip`,
+  which never follows a redirect, and relays no `Location` header.
+- **Authenticated answers are not cacheable.** A response to a request that
+  carried `Authorization` gets `Cache-Control: private, no-store` and
+  `Vary: Authorization`, whatever the upstream said, so no shared cache in front
+  of the proxy can serve one person's private repository to another.
+
+Each point has a test (`authorization_test.go`) that fails if it is broken.
+
+> **The operator of a proxy can read every token that passes through it.**
+> Using a public proxy is a decision to trust its operator. Prefer a forge's
+> REST API, which needs no proxy (GitHub and GitLab answer CORS themselves; see
+> [browsergit](https://github.com/go-browserhttp/browsergit)), or run your own
+> proxy.
 
 ## Library
 
