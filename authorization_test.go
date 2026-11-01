@@ -101,7 +101,7 @@ func TestNoLogLineCarriesTheTokenOrTheQuery(t *testing.T) {
 	paths := []string{
 		target, // upstream error path
 		"http://proxy/evil.example/o/r.git/info/refs?service=git-upload-pack&access_token=" + placeholderToken, // 403 path
-		"http://proxy/github.com/o/r.git/bogus?access_token=" + placeholderToken,                              // 400 path
+		"http://proxy/github.com/o/r.git/bogus?access_token=" + placeholderToken,                               // 400 path
 	}
 	for _, u := range paths {
 		p.ServeHTTP(httptest.NewRecorder(), authReq(http.MethodGet, u))
