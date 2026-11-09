@@ -74,6 +74,12 @@ are preserved on the way back.
   writes a token, a header dump, a query string or a request body to the
   logger. An upstream error is logged without its URL, because a client
   controls the query string and could have put a credential in it.
+- **A refused host segment is never logged raw.** The first path segment is
+  client-controlled and may be `user:token@host`. The 403 lines log it only
+  after parsing it as an authority (RFC 3986 section 3.2.1: no password in
+  clear text), dropping the userinfo, and only if what is left is a strict
+  `hostname[:port]` of bounded length; otherwise they log `<invalid-host>`.
+  `FuzzRedactHost` and `FuzzRefusalLog` (corpus in `testdata/fuzz`) run in CI.
 - **It reaches only that request's upstream.** The proxy uses `RoundTrip`,
   which never follows a redirect, and relays no `Location` header.
 - **Authenticated answers are not cacheable.** A response to a request that

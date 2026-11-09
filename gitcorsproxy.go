@@ -44,6 +44,9 @@
 //     in this package writes a token, a header dump, a query string or a
 //     request body to the logger (an upstream error is logged without its URL,
 //     whose query a client controls).
+//   - A refused host segment (client-controlled, possibly "user:token@host") is
+//     logged only through redactHost: userinfo dropped, strict hostname[:port]
+//     shape, bounded length, else a fixed placeholder.
 //   - It goes only to the allowlisted upstream of that request: the proxy uses
 //     RoundTrip, which never follows a redirect, and relays no Location header.
 //   - A response to a request that carried Authorization is marked
@@ -364,7 +367,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Allowlist: the primary SSRF control.
 	if _, ok := p.hosts[strings.ToLower(host)]; !ok {
-		p.log.Warn("gitcorsproxy: host not allowed", "host", host, "client", p.clientIP(r))
+		p.log.Warn("gitcorsproxy: host not allowed", "host", redactHost(host), "client", p.clientIP(r))
 		http.Error(w, "upstream host not allowed", http.StatusForbidden)
 		return
 	}
@@ -372,7 +375,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Defence in depth: refuse an allowlisted host that resolves into a
 	// private/loopback/link-local/metadata range.
 	if err := p.checkHost(host); err != nil {
-		p.log.Warn("gitcorsproxy: host rejected by SSRF guard", "host", host, "reason", err.Error(), "client", p.clientIP(r))
+		p.log.Warn("gitcorsproxy: host rejected by SSRF guard", "host", redactHost(host), "reason", err.Error(), "client", p.clientIP(r))
 		http.Error(w, "upstream host rejected", http.StatusForbidden)
 		return
 	}
@@ -443,6 +446,37 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// failure to the client — record it (never the token) and stop.
 		p.log.Warn("gitcorsproxy: response copy interrupted", "host", host, "error", err.Error())
 	}
+}
+
+// maxLoggedHost bounds the host text a log line may carry (the DNS limit is
+// 253 characters, plus ":65535").
+const maxLoggedHost = 260
+
+// redactedHost is what the log carries when a host segment is not a plain
+// hostname[:port].
+const redactedHost = "<invalid-host>"
+
+// hostShape is a strict hostname[:port]: letters, digits, dots and hyphens,
+// starting and ending alphanumeric, with an optional numeric port. No "@", no
+// ":" outside the port, no percent-escape, no underscore.
+var hostShape = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?$`)
+
+// redactHost returns the text of a first path segment that is safe to log.
+// The segment is client-controlled and may be an authority carrying userinfo
+// ("user:token@host"; RFC 3986 section 3.2.1 says a password there must not be
+// rendered in clear text). It is parsed as an authority, the userinfo is
+// dropped, and the host is kept only if it has the strict hostname[:port]
+// shape and a bounded length; anything else becomes a fixed placeholder.
+func redactHost(segment string) string {
+	u, err := url.Parse("//" + segment)
+	if err != nil {
+		return redactedHost
+	}
+	h := u.Host
+	if len(h) > maxLoggedHost || !hostShape.MatchString(h) {
+		return redactedHost
+	}
+	return strings.ToLower(h)
 }
 
 // upstreamErr is the loggable text of a round-trip error: a *url.Error carries

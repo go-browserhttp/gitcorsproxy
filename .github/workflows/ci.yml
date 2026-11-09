@@ -37,6 +37,10 @@ jobs:
         run: CGO_ENABLED=0 go vet ./...
       - name: Test with coverage (race)
         run: go test -race -covermode=atomic -coverprofile=cover.out ./...
+      - name: Fuzz (30s per target; the committed corpus also runs in the tests above)
+        run: |
+          go test -run='^$' -fuzz='^FuzzRedactHost$' -fuzztime=30s .
+          go test -run='^$' -fuzz='^FuzzRefusalLog$' -fuzztime=30s .
       - name: Enforce 100% coverage
         run: |
           go tool cover -func=cover.out
