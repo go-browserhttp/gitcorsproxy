@@ -13,7 +13,7 @@
 //	-tls-key             GITCORSPROXY_TLS_KEY             optional TLS key file
 //	-rate                GITCORSPROXY_RATE                requests per minute per client IP        (default 120)
 //	-burst               GITCORSPROXY_BURST               back-to-back request burst per client IP (default 30)
-//	-trusted-hops        GITCORSPROXY_TRUSTED_HOPS        trusted reverse-proxy hops for XFF       (default 1)
+//	-trusted-hops        GITCORSPROXY_TRUSTED_HOPS        trusted reverse-proxy hops for XFF       (default -1 = auto: 0 with -tls-cert/-tls-key, else 1)
 //	-max-response-bytes  GITCORSPROXY_MAX_RESPONSE_BYTES  cap on one relayed response, 0=unlimited (default 1073741824)
 //	-timeout             GITCORSPROXY_TIMEOUT             per-request timeout, 0=none              (default 5m0s)
 //
@@ -29,7 +29,11 @@
 //   - -rate/-burst apply a per-client-IP token bucket; over budget → 429 with
 //     Retry-After. The client IP is read from X-Forwarded-For counting from the
 //     right by -trusted-hops (so a client-forged leftmost XFF cannot spoof the
-//     key), falling back to the connection's RemoteAddr.
+//     key), falling back to the connection's RemoteAddr. -trusted-hops counts
+//     reverse proxies between the client and this process that APPEND to
+//     X-Forwarded-For. Left on auto it is 1 behind Caddy and 0 when this
+//     process serves TLS itself, where nothing appends the header and any
+//     entry is the client's; a non-zero value there prints a warning.
 //   - -max-response-bytes caps a single relayed response so the proxy cannot be
 //     used to shift unbounded bandwidth.
 //   - -timeout bounds the whole proxied request so a slow-loris or hung upstream
@@ -76,11 +80,17 @@ func run(args []string, stderr io.Writer) int {
 	tlsKey := fs.String("tls-key", env("GITCORSPROXY_TLS_KEY", ""), "optional TLS key file")
 	rate := fs.Int("rate", envInt("GITCORSPROXY_RATE", 120), "requests per minute per client IP (0 disables)")
 	burst := fs.Int("burst", envInt("GITCORSPROXY_BURST", 30), "back-to-back request burst per client IP")
-	trustedHops := fs.Int("trusted-hops", envInt("GITCORSPROXY_TRUSTED_HOPS", 1), "trusted reverse-proxy hops for X-Forwarded-For")
+	trustedHops := fs.Int("trusted-hops", envInt("GITCORSPROXY_TRUSTED_HOPS", autoHops), "trusted reverse-proxy hops for X-Forwarded-For; -1 = auto: 0 when this process serves TLS itself (-tls-cert/-tls-key), else 1")
 	maxRespBytes := fs.Int64("max-response-bytes", envInt64("GITCORSPROXY_MAX_RESPONSE_BYTES", 1<<30), "cap on one relayed response in bytes (0 = unlimited)")
 	timeout := fs.Duration("timeout", envDuration("GITCORSPROXY_TIMEOUT", 300*time.Second), "per-request timeout (0 = none)")
 	if err := fs.Parse(args); err != nil {
 		return 2
+	}
+
+	serveTLS := *tlsCert != "" && *tlsKey != ""
+	hops, warn := resolveTrustedHops(*trustedHops, serveTLS)
+	if warn != "" {
+		fmt.Fprintln(stderr, "gitcorsproxy: warning:", warn)
 	}
 
 	proxy, err := gitcorsproxy.New(gitcorsproxy.Config{
@@ -88,7 +98,7 @@ func run(args []string, stderr io.Writer) int {
 		UpstreamHosts:    splitList(*hosts),
 		RatePerMinute:    *rate,
 		Burst:            *burst,
-		TrustedProxyHops: *trustedHops,
+		TrustedProxyHops: hops,
 		MaxResponseBytes: *maxRespBytes,
 		Timeout:          *timeout,
 	})
@@ -104,9 +114,9 @@ func run(args []string, stderr io.Writer) int {
 	}
 
 	fmt.Fprintf(stderr, "gitcorsproxy: listening on %s (origins=%s hosts=%s rate=%d/min burst=%d hops=%d max-response=%d timeout=%s)\n",
-		*listen, *origins, *hosts, *rate, *burst, *trustedHops, *maxRespBytes, *timeout)
+		*listen, *origins, *hosts, *rate, *burst, hops, *maxRespBytes, *timeout)
 	var serveErr error
-	if *tlsCert != "" && *tlsKey != "" {
+	if serveTLS {
 		serveErr = listenAndServeTLS(srv, *tlsCert, *tlsKey)
 	} else {
 		serveErr = listenAndServe(srv)
@@ -116,6 +126,30 @@ func run(args []string, stderr io.Writer) int {
 		return 1
 	}
 	return 0
+}
+
+// autoHops is the -trusted-hops default: choose from the TLS mode.
+const autoHops = -1
+
+// resolveTrustedHops turns the -trusted-hops flag into the hop count the proxy
+// uses. A negative value means "auto": 0 when this process terminates TLS
+// itself (nothing sits in front of it, so every X-Forwarded-For entry comes
+// from the client and trusting one would let a client pick its own rate-limit
+// key), 1 behind a single reverse proxy such as Caddy. An explicit non-zero
+// count with TLS served directly is honoured (a CDN may re-encrypt to the
+// origin) but returns a warning, because it is the spoofable configuration
+// when nothing really appends the header.
+func resolveTrustedHops(flagValue int, serveTLS bool) (hops int, warning string) {
+	if flagValue < 0 {
+		if serveTLS {
+			return 0, ""
+		}
+		return 1, ""
+	}
+	if serveTLS && flagValue > 0 {
+		return flagValue, fmt.Sprintf("-trusted-hops=%d while serving TLS directly: a client can choose its own address unless a trusted proxy really appends X-Forwarded-For", flagValue)
+	}
+	return flagValue, ""
 }
 
 // env returns the value of the environment variable key, or def when unset.
