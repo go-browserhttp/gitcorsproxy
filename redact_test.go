@@ -128,8 +128,9 @@ func FuzzRedactHost(f *testing.F) {
 			t.Fatalf("redactHost(%q) = %q: not a bounded, lowercase hostname[:port]", segment, got)
 		}
 		// Whatever precedes the last "@" is userinfo and must never survive.
-		// ("?" and "#" end the authority, so an "@" after them is not userinfo.)
-		if i := strings.LastIndex(segment, "@"); i >= 0 && !strings.ContainsAny(segment, "?#") && !strings.Contains(strings.ToLower(segment[i+1:]), got) {
+		// ("/", "?" and "#" end the authority, so an "@" after them is not
+		// userinfo; a route segment never holds a "/" anyway.)
+		if i := strings.LastIndex(segment, "@"); i >= 0 && !strings.ContainsAny(segment, "/?#") && !strings.Contains(strings.ToLower(segment[i+1:]), got) {
 			t.Fatalf("redactHost(%q) = %q: result is not drawn from the host after the last @", segment, got)
 		}
 	})
