@@ -70,6 +70,14 @@ are preserved on the way back.
   against a private/loopback/link-local/multicast/unspecified/cloud-metadata/
   IPv6-ULA deny-list (ported from the loom server's `checkRemoteIP`), so an
   allow-listed host that resolves into an internal range is still refused.
+- **The checked address is the one dialed (no DNS rebinding).** The host is
+  resolved once; the transport's `DialContext` connects to exactly the
+  addresses that passed the check and re-checks them at dial time, refusing
+  private, loopback, link-local, multicast, unspecified and metadata addresses.
+  A second lookup that answers differently is never consulted. The URL keeps
+  the name, so `Host`, SNI and certificate verification are unchanged. The
+  default transport no longer honours `HTTP_PROXY`/`HTTPS_PROXY`, so the check
+  sees the real target; a `Config.Transport` you supply dials for itself.
 - The **`Authorization` header is never logged.** Nothing in this package
   writes a token, a header dump, a query string or a request body to the
   logger. An upstream error is logged without its URL, because a client

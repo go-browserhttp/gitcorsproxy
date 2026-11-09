@@ -39,7 +39,14 @@
 //   - As defence in depth the target host is resolved and every IP is checked
 //     against a private/loopback/link-local/cloud-metadata denylist (ported
 //     from the loom server's checkRemoteIP), so an allowlisted host that
-//     resolves into an internal range is still refused.
+//     resolves into an internal range is still refused. The host is resolved
+//     ONCE: the default transport's DialContext connects to the addresses that
+//     were checked (and checks them again at dial time), never to the result of
+//     a second lookup, so DNS rebinding between check and connect cannot reach a
+//     private address. The URL keeps the name, so Host, SNI and certificate
+//     verification are unchanged. A Config.Transport you supply dials for
+//     itself and bypasses this; the default transport ignores proxy
+//     environment variables so the check sees the real target.
 //   - The Authorization header is forwarded upstream but NEVER logged. Nothing
 //     in this package writes a token, a header dump, a query string or a
 //     request body to the logger (an upstream error is logged without its URL,
@@ -177,6 +184,7 @@ type Proxy struct {
 	log       *slog.Logger
 	transport http.RoundTripper
 	lookupIP  func(host string) ([]net.IP, error)
+	rawDial   func(ctx context.Context, network, addr string) (net.Conn, error)
 
 	limiter  *rateLimiter // nil when rate limiting is disabled
 	hops     int
@@ -243,15 +251,20 @@ func New(cfg Config) (*Proxy, error) {
 	if p.log == nil {
 		p.log = slog.Default()
 	}
+	if p.lookupIP == nil {
+		p.lookupIP = net.LookupIP
+	}
+	if p.rawDial == nil {
+		p.rawDial = (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext
+	}
 	if p.transport == nil {
+		// No Proxy: the dial check below must see the real target, not an
+		// environment proxy that would resolve the name on its own.
 		p.transport = &http.Transport{
-			Proxy:              http.ProxyFromEnvironment,
+			DialContext:        p.dialContext,
 			DisableCompression: true, // relay git bytes (and Content-Encoding) verbatim
 			ForceAttemptHTTP2:  true,
 		}
-	}
-	if p.lookupIP == nil {
-		p.lookupIP = net.LookupIP
 	}
 	if cfg.RatePerMinute > 0 {
 		burst := cfg.Burst
@@ -374,7 +387,8 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Defence in depth: refuse an allowlisted host that resolves into a
 	// private/loopback/link-local/metadata range.
-	if err := p.checkHost(host); err != nil {
+	ips, err := p.checkHost(host)
+	if err != nil {
 		p.log.Warn("gitcorsproxy: host rejected by SSRF guard", "host", redactHost(host), "reason", err.Error(), "client", p.clientIP(r))
 		http.Error(w, "upstream host rejected", http.StatusForbidden)
 		return
@@ -393,7 +407,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Bound the whole proxied request so a slow/hung upstream cannot pin
 	// resources. The deadline covers the round-trip AND the streamed body,
 	// because the request context propagates to resp.Body reads.
-	ctx := r.Context()
+	ctx := withResolved(r.Context(), hostname(host), ips)
 	if p.timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, p.timeout)
@@ -527,29 +541,104 @@ func (p *Proxy) setCORS(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// checkHost resolves host and rejects it if any resolved IP is in a
-// non-public range. A literal IP host is checked directly.
-func (p *Proxy) checkHost(host string) error {
-	// Strip a :port if present so the resolver sees a bare host.
+// hostname strips a :port from host so a resolver sees a bare name.
+func hostname(host string) string {
 	if h, _, err := net.SplitHostPort(host); err == nil {
-		host = h
+		return h
 	}
+	return host
+}
+
+// resolve returns the addresses of a bare host (no port): a literal IP is
+// itself, a name goes through the injectable resolver.
+func (p *Proxy) resolve(host string) ([]net.IP, error) {
 	if ip := net.ParseIP(host); ip != nil {
-		return checkRemoteIP(ip)
+		return []net.IP{ip}, nil
 	}
 	ips, err := p.lookupIP(host)
 	if err != nil {
-		return fmt.Errorf("resolve %q: %w", host, err)
+		return nil, fmt.Errorf("resolve %q: %w", host, err)
 	}
 	if len(ips) == 0 {
-		return fmt.Errorf("resolve %q: no addresses", host)
+		return nil, fmt.Errorf("resolve %q: no addresses", host)
 	}
+	return ips, nil
+}
+
+// checkIPs rejects the set if any address is in a non-public range.
+func checkIPs(ips []net.IP) error {
 	for _, ip := range ips {
 		if err := checkRemoteIP(ip); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// checkHost resolves host (a :port is ignored) ONCE and rejects it if any
+// resolved IP is in a non-public range. The addresses are returned so the
+// connection can be made to exactly the ones that were checked (see
+// withResolved and dialContext): resolving again at connect time would let an
+// answer that changes between the two lookups (DNS rebinding, a short TTL)
+// reach an address the check never saw.
+func (p *Proxy) checkHost(host string) ([]net.IP, error) {
+	ips, err := p.resolve(hostname(host))
+	if err != nil {
+		return nil, err
+	}
+	if err := checkIPs(ips); err != nil {
+		return nil, err
+	}
+	return ips, nil
+}
+
+// resolvedKey keys the addresses checkHost approved in a request context.
+type resolvedKey struct{}
+
+// resolvedHost is a host name together with the addresses that were checked
+// for it.
+type resolvedHost struct {
+	name string
+	ips  []net.IP
+}
+
+// withResolved records, on the request context, the addresses checked for
+// name, for dialContext to connect to.
+func withResolved(ctx context.Context, name string, ips []net.IP) context.Context {
+	return context.WithValue(ctx, resolvedKey{}, resolvedHost{name: name, ips: ips})
+}
+
+// dialContext is the transport's DialContext. It connects to an IP address and
+// never lets the system resolver pick one: it takes the addresses checkHost
+// approved for this request (carried on ctx), or, when the connection is made
+// for a name it has not seen, resolves once itself. Either way every address
+// is checked again here and a private, loopback, link-local, multicast,
+// unspecified or metadata address is refused at dial time. The URL keeps the
+// name, so the Host header and the TLS server name (SNI and certificate
+// verification) are unchanged.
+func (p *Proxy) dialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, err
+	}
+	var ips []net.IP
+	if r, ok := ctx.Value(resolvedKey{}).(resolvedHost); ok && strings.EqualFold(r.name, host) {
+		ips = r.ips
+	} else if ips, err = p.resolve(host); err != nil {
+		return nil, err
+	}
+	if err := checkIPs(ips); err != nil {
+		return nil, err
+	}
+	var errs []error
+	for _, ip := range ips {
+		conn, err := p.rawDial(ctx, network, net.JoinHostPort(ip.String(), port))
+		if err == nil {
+			return conn, nil
+		}
+		errs = append(errs, err)
+	}
+	return nil, errors.Join(errs...)
 }
 
 // checkRemoteIP rejects an IP in a private/loopback/link-local/multicast/
