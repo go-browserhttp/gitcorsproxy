@@ -37,8 +37,16 @@ POST /<host>/<owner>/<repo>.git/git-receive-pack
 
 is proxied to `https://<host>/<owner>/<repo>.git/…`. The `<owner>/<repo>` part
 may contain nested groups (Forgejo/GitLab subgroups). Anything that does not
-match this shape is rejected `400`. `info/refs` must be a `GET` with a valid
-`service` query; the pack endpoints must be `POST`.
+match this shape is rejected `400`. `info/refs` must be a `GET` with exactly
+one `service` query value naming a git service; the pack endpoints must be
+`POST`. The repository path is forwarded verbatim, so a path with an empty,
+`.` or `..` segment (also percent-encoded, or made with `%2f`), a control
+character or a backslash is rejected `400`: an upstream that cleans paths could
+otherwise be steered out of the repository the allow-list was meant to reach.
+The parser is fuzzed (`FuzzRoute`, corpus in `testdata/fuzz/FuzzRoute`, run in
+CI): an accepted request always has an allow-listed host, one of the four git
+endpoints with the right method, a clean repository path, and an upstream URL
+whose host is exactly the parsed host.
 
 This is exactly the client contract of the go-tex playground's `browsergit`
 package, whose panel accepts a proxy-prefixed base URL like

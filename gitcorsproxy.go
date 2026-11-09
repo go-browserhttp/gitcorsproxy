@@ -51,6 +51,10 @@
 //     in this package writes a token, a header dump, a query string or a
 //     request body to the logger (an upstream error is logged without its URL,
 //     whose query a client controls).
+//   - The route parser (parseRoute) is fuzzed (FuzzRoute). It refuses a
+//     repository path with an empty, "." or ".." segment (also percent-encoded,
+//     or built with %2f), a control character or a backslash, and an info/refs
+//     query that does not carry exactly one git service value.
 //   - A refused host segment (client-controlled, possibly "user:token@host") is
 //     logged only through redactHost: userinfo dropped, strict hostname[:port]
 //     shape, bounded length, else a fixed placeholder.
@@ -299,6 +303,91 @@ var gitService = map[string]struct{}{
 	"git-receive-pack": {},
 }
 
+// route is an accepted request target: the allowlisted upstream host, the
+// repository path (escaped, verbatim) and the endpoint.
+type route struct {
+	host, repoPath, service string
+}
+
+func (rt route) upstreamPath() string { return "/" + rt.repoPath + "/" + rt.service }
+
+// upstreamURL is the URL the request is forwarded to.
+func (rt route) upstreamURL(scheme, rawQuery string) string {
+	u := scheme + "://" + rt.host + rt.upstreamPath()
+	if rawQuery != "" {
+		u += "?" + rawQuery
+	}
+	return u
+}
+
+// parseRoute decides which upstream a request may reach. It returns status 0
+// with the route when the request is accepted, otherwise the HTTP status and
+// message to answer with (and, for 403, the route whose host was refused).
+// It is the proxy's most security-relevant parser, because its result selects
+// the host that receives the client's Authorization header, so it is fuzzed
+// (FuzzRoute).
+//
+// An accepted route always has: an allowlisted host; a repository path none of
+// whose decoded segments is empty, "." or ".." (an upstream that cleans paths
+// would otherwise be steered out of the repository) and which holds no control
+// character or backslash; one of the four git endpoints with the matching
+// method; and, for info/refs, exactly one service query value naming a git
+// service.
+func (p *Proxy) parseRoute(method string, u *url.URL) (rt route, status int, msg string) {
+	m := gitRoute.FindStringSubmatch(u.EscapedPath())
+	if m == nil {
+		return rt, http.StatusBadRequest, "not a git smart-HTTP endpoint"
+	}
+	// host is the first path segment (a plain hostname[:port]); repoPath and
+	// service keep their escaped form so they forward upstream verbatim.
+	rt = route{host: m[1], repoPath: m[2], service: m[3]}
+	if !cleanRepoPath(rt.repoPath) {
+		return rt, http.StatusBadRequest, "bad repository path"
+	}
+
+	// Method must match the endpoint: info/refs is a GET, the pack endpoints
+	// are POSTs.
+	if rt.service == "info/refs" {
+		if method != http.MethodGet {
+			return rt, http.StatusMethodNotAllowed, "info/refs must be GET"
+		}
+		q, err := url.ParseQuery(u.RawQuery)
+		svc := q["service"]
+		if _, ok := gitService[strings.Join(svc, "")]; err != nil || len(svc) != 1 || !ok {
+			return rt, http.StatusBadRequest, "info/refs requires a git service query"
+		}
+	} else if method != http.MethodPost {
+		return rt, http.StatusMethodNotAllowed, rt.service + " must be POST"
+	}
+
+	if _, ok := p.hosts[strings.ToLower(rt.host)]; !ok {
+		return rt, http.StatusForbidden, "upstream host not allowed"
+	}
+	return rt, 0, ""
+}
+
+// cleanRepoPath reports whether an escaped repository path is safe to forward
+// verbatim: it decodes, no decoded segment is empty, "." or "..", and nothing
+// in it is a control character or a backslash. Decoding first means "%2e%2e"
+// and "..%2f.." are caught as well as "..".
+func cleanRepoPath(escaped string) bool {
+	dec, err := url.PathUnescape(escaped)
+	if err != nil {
+		return false
+	}
+	for _, c := range []byte(dec) {
+		if c < 0x20 || c == 0x7f || c == '\\' {
+			return false
+		}
+	}
+	for _, seg := range strings.Split(dec, "/") {
+		if seg == "" || seg == "." || seg == ".." {
+			return false
+		}
+	}
+	return true
+}
+
 // forwardRequestHeaders are the request headers relayed upstream. Authorization
 // rides here (and is never logged).
 var forwardRequestHeaders = []string{
@@ -353,37 +442,16 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	m := gitRoute.FindStringSubmatch(r.URL.EscapedPath())
-	if m == nil {
-		http.Error(w, "not a git smart-HTTP endpoint", http.StatusBadRequest)
+	rt, status, msg := p.parseRoute(r.Method, r.URL)
+	if status == http.StatusForbidden {
+		// Allowlist: the primary SSRF control.
+		p.log.Warn("gitcorsproxy: host not allowed", "host", redactHost(rt.host), "client", p.clientIP(r))
+	}
+	if status != 0 {
+		http.Error(w, msg, status)
 		return
 	}
-	// host is the first path segment (a plain hostname[:port]); repoPath and
-	// service keep their escaped form so they forward upstream verbatim.
-	host, repoPath, service := m[1], m[2], m[3]
-
-	// Method must match the endpoint: info/refs is a GET, the pack endpoints
-	// are POSTs.
-	if service == "info/refs" {
-		if r.Method != http.MethodGet {
-			http.Error(w, "info/refs must be GET", http.StatusMethodNotAllowed)
-			return
-		}
-		if _, ok := gitService[r.URL.Query().Get("service")]; !ok {
-			http.Error(w, "info/refs requires a git service query", http.StatusBadRequest)
-			return
-		}
-	} else if r.Method != http.MethodPost {
-		http.Error(w, service+" must be POST", http.StatusMethodNotAllowed)
-		return
-	}
-
-	// Allowlist: the primary SSRF control.
-	if _, ok := p.hosts[strings.ToLower(host)]; !ok {
-		p.log.Warn("gitcorsproxy: host not allowed", "host", redactHost(host), "client", p.clientIP(r))
-		http.Error(w, "upstream host not allowed", http.StatusForbidden)
-		return
-	}
+	host, service := rt.host, rt.service
 
 	// Defence in depth: refuse an allowlisted host that resolves into a
 	// private/loopback/link-local/metadata range.
@@ -394,11 +462,8 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	upstreamPath := "/" + repoPath + "/" + service
-	upstream := p.scheme + "://" + host + upstreamPath
-	if r.URL.RawQuery != "" {
-		upstream += "?" + r.URL.RawQuery
-	}
+	upstreamPath := rt.upstreamPath()
+	upstream := rt.upstreamURL(p.scheme, r.URL.RawQuery)
 
 	// Log the decision — method, upstream host, path, service — but never the
 	// Authorization header, token or body.
