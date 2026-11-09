@@ -7,7 +7,9 @@ import (
 	"bytes"
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -121,6 +123,88 @@ func TestRunHardeningFlags(t *testing.T) {
 	}, &bytes.Buffer{})
 	if code != 0 {
 		t.Fatalf("code = %d, want 0", code)
+	}
+}
+
+func TestResolveTrustedHops(t *testing.T) {
+	tests := []struct {
+		name     string
+		flag     int
+		tls      bool
+		want     int
+		wantWarn bool
+	}{
+		{"auto behind a proxy", autoHops, false, 1, false},
+		{"auto serving TLS directly", autoHops, true, 0, false},
+		{"explicit 0 behind a proxy", 0, false, 0, false},
+		{"explicit 2 behind a proxy", 2, false, 2, false},
+		{"explicit 0 with TLS", 0, true, 0, false},
+		{"explicit 1 with TLS warns", 1, true, 1, true},
+	}
+	for _, tt := range tests {
+		got, warn := resolveTrustedHops(tt.flag, tt.tls)
+		if got != tt.want || (warn != "") != tt.wantWarn {
+			t.Errorf("%s: resolveTrustedHops(%d, %v) = %d, %q", tt.name, tt.flag, tt.tls, got, warn)
+		}
+	}
+}
+
+// serveAndProbe runs the command with args, captures the handler it would
+// serve, and sends two requests from one connection address whose
+// X-Forwarded-For differs only in its rightmost entry (the one a client picks
+// when nothing in front of the proxy appends it). Burst 1 means the second
+// request is throttled exactly when both map to the same limiter key. It
+// returns the second response's status and what the command wrote to stderr.
+func serveAndProbe(t *testing.T, args []string) (int, string) {
+	t.Helper()
+	var h http.Handler
+	capture := func(s *http.Server, _, _ string) error { h = s.Handler; return nil }
+	restore := swapServe(capture, capture)
+	defer restore()
+	var stderr bytes.Buffer
+	base := []string{"-origins", "https://x", "-hosts", "github.com", "-rate", "1", "-burst", "1"}
+	if code := run(append(base, args...), &stderr); code != 0 {
+		t.Fatalf("run = %d: %s", code, stderr.String())
+	}
+	var second int
+	for _, xff := range []string{"198.51.100.1", "198.51.100.2"} {
+		req := httptest.NewRequest(http.MethodGet, "http://p/not-a-git-endpoint", nil)
+		req.RemoteAddr = "203.0.113.7:4444"
+		req.Header.Set("X-Forwarded-For", xff)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		second = rec.Code
+	}
+	return second, stderr.String()
+}
+
+func TestSpoofedXFFWhenServingTLSDirectly(t *testing.T) {
+	tlsArgs := []string{"-tls-cert", "c.pem", "-tls-key", "k.pem"}
+
+	// Default with TLS: nothing in front, so XFF is ignored and both requests
+	// share the RemoteAddr key; the second is throttled.
+	code, errOut := serveAndProbe(t, tlsArgs)
+	if code != http.StatusTooManyRequests {
+		t.Fatalf("TLS default: second request = %d, want 429 (the forged XFF must not change the key)", code)
+	}
+	if !strings.Contains(errOut, "hops=0") || strings.Contains(errOut, "warning") {
+		t.Fatalf("TLS default banner:\n%s", errOut)
+	}
+
+	// Default behind a proxy (no TLS): one trusted hop, the rightmost XFF entry
+	// is the client, so the two requests are distinct clients.
+	code, errOut = serveAndProbe(t, nil)
+	if code == http.StatusTooManyRequests {
+		t.Fatalf("proxy default: second request throttled, want it keyed on the XFF entry")
+	}
+	if !strings.Contains(errOut, "hops=1") {
+		t.Fatalf("proxy default banner:\n%s", errOut)
+	}
+
+	// Explicit hops with TLS is honoured, with a warning.
+	code, errOut = serveAndProbe(t, append([]string{"-trusted-hops", "1"}, tlsArgs...))
+	if code == http.StatusTooManyRequests || !strings.Contains(errOut, "hops=1") || !strings.Contains(errOut, "warning") {
+		t.Fatalf("explicit hops with TLS: code=%d\n%s", code, errOut)
 	}
 }
 

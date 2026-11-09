@@ -127,7 +127,7 @@ Each flag falls back to an environment variable:
 | `-tls-key`            | `GITCORSPROXY_TLS_KEY`            | —            | optional TLS key file                                |
 | `-rate`               | `GITCORSPROXY_RATE`               | `120`        | requests per minute per client IP (`0` disables)     |
 | `-burst`              | `GITCORSPROXY_BURST`              | `30`         | back-to-back request burst per client IP             |
-| `-trusted-hops`       | `GITCORSPROXY_TRUSTED_HOPS`       | `1`          | trusted reverse-proxy hops for `X-Forwarded-For`     |
+| `-trusted-hops`       | `GITCORSPROXY_TRUSTED_HOPS`       | `-1` (auto)  | trusted reverse-proxy hops; auto = `1`, `0` with TLS flags (see below) |
 | `-max-response-bytes` | `GITCORSPROXY_MAX_RESPONSE_BYTES` | `1073741824` | cap on one relayed response in bytes (`0` unlimited) |
 | `-timeout`            | `GITCORSPROXY_TIMEOUT`            | `5m0s`       | per-request timeout (`0` = none)                     |
 
@@ -147,8 +147,16 @@ It therefore defends itself:
 - **Trustworthy client IP.** Behind Caddy the real client is the **rightmost**
   `X-Forwarded-For` entry Caddy appended — a client-forged **leftmost** entry is
   ignored. `-trusted-hops` N reads the `(1+N)`-th entry from the right of the
-  `[X-Forwarded-For…, RemoteAddr]` chain (default `1` = one Caddy hop), falling
-  back to the connection `RemoteAddr` when the header is absent or too short.
+  `[X-Forwarded-For…, RemoteAddr]` chain, falling back to the connection
+  `RemoteAddr` when the header is absent or too short. `-trusted-hops` counts
+  the reverse proxies that **append** to the header. Left on auto it is `1`
+  behind Caddy, and `0` when the proxy serves TLS itself (`-tls-cert` and
+  `-tls-key`): nothing in front appends the header, so every entry is the
+  client's and trusting one would let a client choose the address the rate
+  limiter and fail2ban key on. An explicit non-zero value with TLS served
+  directly is honoured (for example a CDN that re-encrypts to the origin) but
+  prints a warning at startup. Set `-trusted-hops 2` if a CDN sits in front of
+  Caddy.
 - **Response-size cap.** `-max-response-bytes` bounds a single relayed response
   so the proxy cannot be used to shift unbounded bandwidth. A declared
   `Content-Length` over the cap is refused `502` before any body streams; an
