@@ -41,6 +41,7 @@ jobs:
         run: |
           go test -run='^$' -fuzz='^FuzzRedactHost$' -fuzztime=30s .
           go test -run='^$' -fuzz='^FuzzRefusalLog$' -fuzztime=30s .
+          go test -run='^$' -fuzz='^FuzzRoute$' -fuzztime=30s .
       - name: Enforce 100% coverage
         run: |
           go tool cover -func=cover.out
